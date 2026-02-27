@@ -133,8 +133,8 @@ def parse_units(uses_section: str) -> list[dict]:
 
 def find_sibling_files(source_file: Path) -> list[Path]:
     """
-    Dado o caminho de um .pas, procura todos os arquivos com o mesmo
-    nome base (qualquer extensão) no mesmo diretório.
+    Dado o caminho absoluto/resolvido de um .pas, procura todos os arquivos
+    com o mesmo nome base (qualquer extensão) no mesmo diretório.
     """
     found = [source_file] if source_file.exists() else []
     stem = source_file.stem
@@ -148,6 +148,37 @@ def find_sibling_files(source_file: Path) -> list[Path]:
     return found
 
 
+def get_relative_dest(source: Path, base_dir: Path) -> Path:
+    """
+    Calcula o caminho relativo de *source* em relação a *base_dir*.
+
+    Caso o arquivo esteja fora de base_dir (caminhos com '..'), sobe na
+    árvore de diretórios até encontrar o ancestral comum e usa o caminho
+    a partir dele.
+
+    Exemplos
+    --------
+    base_dir = /projetos/autcom
+    source   = /projetos/autcom/fontes/genericos/untPai.pas
+    → fontes/genericos/untPai.pas
+
+    base_dir = /projetos/autcom
+    source   = /projetos/AutBan/Genericos/untTUpdateBolCtrLote.pas
+    → AutBan/Genericos/untTUpdateBolCtrLote.pas   (relativo a /projetos)
+    """
+    try:
+        return source.relative_to(base_dir)
+    except ValueError:
+        ancestor = base_dir.parent
+        while ancestor != ancestor.parent:   # enquanto não for a raiz do SO
+            try:
+                return source.relative_to(ancestor)
+            except ValueError:
+                ancestor = ancestor.parent
+        # Último recurso: apenas o nome do arquivo
+        return Path(source.name)
+
+
 def copy_unit_files(
     unit_info: dict,
     base_dir: Path,
@@ -156,13 +187,18 @@ def copy_unit_files(
 ) -> list[Path]:
     """
     Copia os arquivos da unit para o destino.
+
+    Resolve caminhos com '..' (ex: '..\\AutBan\\Genericos\\untFile.pas')
+    antes de localizar e copiar os arquivos.
     Retorna lista de arquivos copiados.
     """
     if unit_info['path'] is None:
         return []
 
+    # resolve() normaliza separadores e expande '..' sem exigir que o
+    # caminho exista no sistema de arquivos atual
     rel_path = Path(unit_info['path'])
-    source_file = base_dir / rel_path
+    source_file = (base_dir / rel_path).resolve()
 
     siblings = find_sibling_files(source_file)
     if not siblings:
@@ -171,10 +207,8 @@ def copy_unit_files(
     copied = []
     for src in siblings:
         if preserve_structure:
-            # Mantém a estrutura de subdiretórios
-            dest_file = dest_dir / src.relative_to(base_dir)
+            dest_file = dest_dir / get_relative_dest(src, base_dir)
         else:
-            # Tudo na raiz do destino
             dest_file = dest_dir / src.name
 
         dest_file.parent.mkdir(parents=True, exist_ok=True)

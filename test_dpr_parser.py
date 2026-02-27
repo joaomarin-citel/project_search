@@ -12,6 +12,7 @@ from dpr_parser import (
     extract_uses_section,
     parse_units,
     find_sibling_files,
+    get_relative_dest,
     copy_unit_files,
 )
 
@@ -52,7 +53,9 @@ uses
   untCadGrupoAtributo in 'fontes\cadastros\untCadGrupoAtributo.pas' {frmCadGrupoAtributo},
   untCadAtributos in 'fontes\cadastros\untCadAtributos.pas' {frmCadAtributos},
   untCadAtividades in 'fontes\Cadastros\untCadAtividades.pas' {frmCadAtividades},
-  untCadCartoes in 'fontes\Cadastros\untCadCartoes.pas' {frmCadCartoes};
+  untCadCartoes in 'fontes\Cadastros\untCadCartoes.pas' {frmCadCartoes},
+  untTUpdateBolCtrLote in '..\AutBan\Genericos\untTUpdateBolCtrLote.pas',
+  untTUpdateDupCobLote in '..\AutBan\Genericos\untTUpdateDupCobLote.pas';
 
 begin
   Application.Initialize;
@@ -212,6 +215,85 @@ class TestCopyUnitFiles(unittest.TestCase):
         unit_info = {'unit': 'untNaoExiste', 'path': 'fontes/untNaoExiste.pas'}
         copied = copy_unit_files(unit_info, self.base, self.dest)
         self.assertEqual(copied, [])
+
+
+class TestGetRelativeDest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        # /tmp/xxx/projetos/autcom   ← base_dir
+        # /tmp/xxx/projetos/AutBan   ← projeto irmão
+        self.base = self.tmp / 'projetos' / 'autcom'
+        self.base.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_file_inside_base(self):
+        src = self.base / 'fontes' / 'genericos' / 'untPai.pas'
+        rel = get_relative_dest(src, self.base)
+        self.assertEqual(rel, Path('fontes/genericos/untPai.pas'))
+
+    def test_file_outside_base_sibling_dir(self):
+        # Arquivo em /tmp/xxx/projetos/AutBan/Genericos/untFile.pas
+        sibling = self.tmp / 'projetos' / 'AutBan' / 'Genericos' / 'untFile.pas'
+        rel = get_relative_dest(sibling, self.base)
+        # Deve ser relativo ao ancestral comum (/tmp/xxx/projetos)
+        self.assertEqual(rel, Path('AutBan/Genericos/untFile.pas'))
+
+    def test_file_two_levels_up(self):
+        # Arquivo em /tmp/xxx/OutroProjeto/untFile.pas  (2 níveis acima de autcom)
+        other = self.tmp / 'OutroProjeto' / 'untFile.pas'
+        rel = get_relative_dest(other, self.base)
+        self.assertEqual(rel, Path('OutroProjeto/untFile.pas'))
+
+
+class TestCopyUnitFilesWithDotDot(unittest.TestCase):
+    """Testa cópia de units com caminhos relativos usando '..'"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        # Estrutura:
+        #   tmp/projetos/autcom/          ← base_dir (onde fica o .dpr)
+        #   tmp/projetos/AutBan/Genericos/ ← projeto irmão
+        self.base = self.tmp / 'projetos' / 'autcom'
+        self.dest = self.tmp / 'saida'
+        sibling = self.tmp / 'projetos' / 'AutBan' / 'Genericos'
+        sibling.mkdir(parents=True)
+        self.base.mkdir(parents=True)
+
+        (sibling / 'untTUpdateBolCtrLote.pas').write_text('unit untTUpdateBolCtrLote;')
+        (sibling / 'untTUpdateBolCtrLote.dfm').write_text('object frmBol end')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_resolves_dotdot_path(self):
+        unit_info = {
+            'unit': 'untTUpdateBolCtrLote',
+            'path': '../AutBan/Genericos/untTUpdateBolCtrLote.pas',
+        }
+        copied = copy_unit_files(unit_info, self.base, self.dest, preserve_structure=True)
+        names = {f.name for f in copied}
+        self.assertIn('untTUpdateBolCtrLote.pas', names)
+        self.assertIn('untTUpdateBolCtrLote.dfm', names)
+
+    def test_structure_outside_base(self):
+        unit_info = {
+            'unit': 'untTUpdateBolCtrLote',
+            'path': '../AutBan/Genericos/untTUpdateBolCtrLote.pas',
+        }
+        copy_unit_files(unit_info, self.base, self.dest, preserve_structure=True)
+        # Deve ficar em saida/AutBan/Genericos/ (relativo ao ancestral comum)
+        expected = self.dest / 'AutBan' / 'Genericos' / 'untTUpdateBolCtrLote.pas'
+        self.assertTrue(expected.exists(), f"Esperado em: {expected}")
+
+    def test_parse_dotdot_path_in_uses(self):
+        section = extract_uses_section(SAMPLE_DPR)
+        units = parse_units(section)
+        by_name = {u['unit']: u for u in units}
+        self.assertIn('untTUpdateBolCtrLote', by_name)
+        self.assertIn('untTUpdateDupCobLote', by_name)
+        self.assertIn('..', by_name['untTUpdateBolCtrLote']['path'])
 
 
 if __name__ == '__main__':
