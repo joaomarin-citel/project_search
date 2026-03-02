@@ -13,6 +13,8 @@ from dpr_parser import (
     parse_units,
     find_sibling_files,
     copy_unit_files,
+    validate_file_content,
+    generate_codegraph_config,
 )
 
 # Trecho realista do autcom.dpr
@@ -186,10 +188,11 @@ class TestCopyUnitFiles(unittest.TestCase):
 
     def test_copies_pas_and_dfm(self):
         unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
-        copied = copy_unit_files(unit_info, self.base, self.dest, preserve_structure=True)
+        copied, skipped = copy_unit_files(unit_info, self.base, self.dest, preserve_structure=True)
         names = {f.name for f in copied}
         self.assertIn('untPai.pas', names)
         self.assertIn('untPai.dfm', names)
+        self.assertEqual(skipped, [])
 
     def test_preserves_directory_structure(self):
         unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
@@ -205,13 +208,139 @@ class TestCopyUnitFiles(unittest.TestCase):
 
     def test_no_path_returns_empty(self):
         unit_info = {'unit': 'Forms', 'path': None}
-        copied = copy_unit_files(unit_info, self.base, self.dest)
+        copied, skipped = copy_unit_files(unit_info, self.base, self.dest)
         self.assertEqual(copied, [])
+        self.assertEqual(skipped, [])
 
     def test_missing_file_returns_empty(self):
         unit_info = {'unit': 'untNaoExiste', 'path': 'fontes/untNaoExiste.pas'}
-        copied = copy_unit_files(unit_info, self.base, self.dest)
+        copied, skipped = copy_unit_files(unit_info, self.base, self.dest)
         self.assertEqual(copied, [])
+        self.assertEqual(skipped, [])
+
+    def test_file_within_size_limit_is_copied(self):
+        unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
+        copied, skipped = copy_unit_files(
+            unit_info, self.base, self.dest,
+            preserve_structure=True,
+            max_file_size=500,
+        )
+        self.assertIn('untPai.pas', {f.name for f in copied})
+        self.assertEqual(skipped, [])
+
+    def test_file_exceeding_size_limit_is_skipped(self):
+        large_pas = self.base / 'fontes' / 'genericos' / 'untPai.pas'
+        large_pas.write_bytes(b'x' * 1025)  # 1025 bytes > 1 KB limit
+        unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
+        copied, skipped = copy_unit_files(
+            unit_info, self.base, self.dest,
+            preserve_structure=True,
+            max_file_size=1,
+        )
+        self.assertEqual(copied, [])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn('too large', skipped[0]['reason'])
+        self.assertEqual(skipped[0]['unit'], 'untPai')
+
+    def test_no_size_limit_copies_everything(self):
+        unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
+        copied, skipped = copy_unit_files(
+            unit_info, self.base, self.dest,
+            preserve_structure=True,
+            max_file_size=None,
+        )
+        self.assertGreater(len(copied), 0)
+        self.assertEqual(skipped, [])
+
+
+class TestValidateFileContent(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_valid_utf8_file(self):
+        f = self.tmp / 'good.pas'
+        f.write_text('unit GoodUnit;\nbegin end.', encoding='utf-8')
+        valid, reason = validate_file_content(f)
+        self.assertTrue(valid)
+        self.assertEqual(reason, '')
+
+    def test_valid_latin1_file(self):
+        # latin-1 com acentos — comum em projetos Delphi antigos
+        f = self.tmp / 'latin1.pas'
+        f.write_bytes('unit OldUnit; // coment\xe1rio'.encode('latin-1'))
+        valid, reason = validate_file_content(f)
+        self.assertTrue(valid)
+
+    def test_null_bytes_rejected(self):
+        f = self.tmp / 'binary.pas'
+        f.write_bytes(b'unit Bad;\x00\x00garbage')
+        valid, reason = validate_file_content(f)
+        self.assertFalse(valid)
+        self.assertIn('null bytes', reason)
+
+    def test_binary_extension_not_checked(self):
+        # .dcu é extensão binária — deve ser sempre considerado válido
+        f = self.tmp / 'compiled.dcu'
+        f.write_bytes(b'\x00\x01\x02\x03compiled dcu binary')
+        valid, reason = validate_file_content(f)
+        self.assertTrue(valid)
+
+    def test_dfm_with_null_bytes_rejected(self):
+        f = self.tmp / 'form.dfm'
+        f.write_bytes(b'object Form1: TForm1\x00end')
+        valid, reason = validate_file_content(f)
+        self.assertFalse(valid)
+        self.assertIn('null bytes', reason)
+
+
+class TestGenerateCodegraphConfig(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _load_config(self):
+        import json
+        return json.loads((self.tmp / '.codegraph.json').read_text())
+
+    def test_creates_config_file(self):
+        generate_codegraph_config(self.tmp, [], max_file_size_kb=500)
+        self.assertTrue((self.tmp / '.codegraph.json').exists())
+
+    def test_config_contains_max_file_size_in_bytes(self):
+        generate_codegraph_config(self.tmp, [], max_file_size_kb=500)
+        data = self._load_config()
+        self.assertEqual(data['maxFileSize'], 500 * 1024)
+
+    def test_config_contains_standard_excludes(self):
+        generate_codegraph_config(self.tmp, [], max_file_size_kb=500)
+        data = self._load_config()
+        self.assertIn('*.dcu', data['exclude'])
+        self.assertIn('*.exe', data['exclude'])
+        self.assertIn('__history', data['exclude'])
+
+    def test_skipped_files_added_to_excludes(self):
+        fake_path = self.tmp / 'fontes' / 'untLarge.pas'
+        skipped = [{'file': fake_path, 'unit': 'untLarge', 'reason': 'too large'}]
+        generate_codegraph_config(self.tmp, skipped, max_file_size_kb=500)
+        data = self._load_config()
+        self.assertIn('untLarge.*', data['exclude'])
+
+    def test_no_duplicate_excludes(self):
+        # Mesmo stem em .pas e .dfm — deve aparecer apenas uma vez no exclude
+        fake_pas = self.tmp / 'untDup.pas'
+        fake_dfm = self.tmp / 'untDup.dfm'
+        skipped = [
+            {'file': fake_pas, 'unit': 'untDup', 'reason': 'too large'},
+            {'file': fake_dfm, 'unit': 'untDup', 'reason': 'content issue: null bytes'},
+        ]
+        generate_codegraph_config(self.tmp, skipped, max_file_size_kb=500)
+        data = self._load_config()
+        self.assertEqual(data['exclude'].count('untDup.*'), 1)
 
 
 if __name__ == '__main__':

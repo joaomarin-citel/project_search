@@ -14,6 +14,7 @@ Exemplos:
     python dpr_parser.py autcom.dpr /tmp/saida --base-dir D:\projetos\autcom
 """
 
+import json
 import re
 import sys
 import shutil
@@ -148,28 +149,101 @@ def find_sibling_files(source_file: Path) -> list[Path]:
     return found
 
 
+_TEXT_EXTENSIONS = {'.pas', '.dfm', '.fmx', '.xfm', '.nfm'}
+
+
+def validate_file_content(file_path: Path) -> tuple[bool, str]:
+    """
+    Valida o conteúdo de um arquivo antes de copiá-lo.
+    Retorna (True, '') se válido, ou (False, razão) caso contrário.
+
+    Apenas verifica extensões de texto (.pas, .dfm, .fmx, .xfm, .nfm).
+    Extensões binárias (.dcu, .res, .resx etc.) são sempre consideradas válidas.
+
+    Cheques realizados:
+    - Ausência de null bytes (indica arquivo binário ou corrompido)
+    - Decodificável como UTF-8 (fallback latin-1 para projetos Delphi antigos)
+    """
+    if file_path.suffix.lower() not in _TEXT_EXTENSIONS:
+        return True, ''
+
+    try:
+        raw = file_path.read_bytes()
+    except OSError as e:
+        return False, f'read error: {e}'
+
+    if b'\x00' in raw:
+        return False, 'contains null bytes'
+
+    try:
+        raw.decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            raw.decode('latin-1')
+        except UnicodeDecodeError:
+            return False, 'not decodable as UTF-8 or latin-1'
+
+    return True, ''
+
+
 def copy_unit_files(
     unit_info: dict,
     base_dir: Path,
     dest_dir: Path,
     preserve_structure: bool = True,
-) -> list[Path]:
+    max_file_size: int | None = None,
+    validate_content: bool = False,
+) -> tuple[list[Path], list[dict]]:
     """
     Copia os arquivos da unit para o destino.
-    Retorna lista de arquivos copiados.
+    Retorna (lista de arquivos copiados, lista de arquivos ignorados).
+
+    Cada entry em 'ignorados' é um dict com chaves:
+      'file'   (Path)  — caminho do arquivo ignorado
+      'unit'   (str)   — nome da unit
+      'reason' (str)   — motivo do filtro
+
+    Parâmetros:
+      max_file_size   — tamanho máximo do .pas em KB; None = sem limite.
+                        Se o .pas exceder o limite, toda a unit é ignorada.
+      validate_content — se True, checar null bytes e encoding de cada arquivo
+                         antes de copiar.
     """
     if unit_info['path'] is None:
-        return []
+        return [], []
 
     rel_path = Path(unit_info['path'])
     source_file = base_dir / rel_path
 
     siblings = find_sibling_files(source_file)
     if not siblings:
-        return []
+        return [], []
 
-    copied = []
+    copied: list[Path] = []
+    skipped: list[dict] = []
+
+    # Cheque de tamanho aplicado ao .pas — se falhar, ignora a unit inteira
+    if max_file_size is not None and source_file.exists():
+        size_kb = source_file.stat().st_size / 1024
+        if size_kb > max_file_size:
+            skipped.append({
+                'file': source_file,
+                'unit': unit_info['unit'],
+                'reason': f'too large ({size_kb:.1f} KB > {max_file_size} KB limit)',
+            })
+            return copied, skipped
+
     for src in siblings:
+        if validate_content:
+            valid, reason = validate_file_content(src)
+            if not valid:
+                skipped.append({
+                    'file': src,
+                    'unit': unit_info['unit'],
+                    'reason': f'content issue: {reason}',
+                })
+                continue
+
         if preserve_structure:
             # Mantém a estrutura de subdiretórios
             dest_file = dest_dir / src.relative_to(base_dir)
@@ -181,10 +255,61 @@ def copy_unit_files(
         shutil.copy2(src, dest_file)
         copied.append(dest_file)
 
-    return copied
+    return copied, skipped
 
 
-def parse_dpr(dpr_path: str, dest_dir: str, base_dir: str | None = None, flat: bool = False) -> None:
+def generate_codegraph_config(
+    dest_dir: Path,
+    skipped_files: list[dict],
+    max_file_size_kb: int,
+) -> Path:
+    """
+    Gera um arquivo .codegraph.json em dest_dir.
+
+    Inclui excludes padrão para projetos Delphi e os stems dos arquivos
+    que foram ignorados durante a cópia (para que o codegraph também os ignore).
+    O maxFileSize é convertido para bytes, conforme esperado pelo codegraph.
+
+    Retorna o Path do arquivo gerado.
+    """
+    standard_excludes = [
+        '*.dcu',
+        '*.bpl',
+        '*.bpi',
+        '*.dcp',
+        '*.exe',
+        '*.dll',
+        '*.res',
+        '*.rsm',
+        '__history',
+        '__recovery',
+    ]
+
+    skipped_excludes: list[str] = []
+    for entry in skipped_files:
+        pattern = f"{entry['file'].stem}.*"
+        if pattern not in skipped_excludes and pattern not in standard_excludes:
+            skipped_excludes.append(pattern)
+
+    config = {
+        'maxFileSize': max_file_size_kb * 1024,
+        'exclude': standard_excludes + skipped_excludes,
+    }
+
+    config_path = dest_dir / '.codegraph.json'
+    config_path.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
+    return config_path
+
+
+def parse_dpr(
+    dpr_path: str,
+    dest_dir: str,
+    base_dir: str | None = None,
+    flat: bool = False,
+    max_file_size: int | None = None,
+    validate_content: bool = False,
+    codegraph_config: bool = False,
+) -> None:
     dpr = Path(dpr_path).resolve()
     if not dpr.exists():
         print(f"Erro: arquivo '{dpr}' não encontrado.")
@@ -219,13 +344,23 @@ def parse_dpr(dpr_path: str, dest_dir: str, base_dir: str | None = None, flat: b
 
     total_copied = 0
     not_found = []
+    all_skipped: list[dict] = []
 
     for u in units_with_path:
-        copied = copy_unit_files(u, base, dest, preserve_structure=not flat)
+        copied, skipped = copy_unit_files(
+            u, base, dest,
+            preserve_structure=not flat,
+            max_file_size=max_file_size,
+            validate_content=validate_content,
+        )
+        all_skipped.extend(skipped)
         if copied:
             for f in copied:
                 print(f"  [OK] {f.relative_to(dest)}")
             total_copied += len(copied)
+        elif skipped:
+            for s in skipped:
+                print(f"  [IGNORADO] {u['unit']} -> {s['reason']}")
         else:
             rel = u['path']
             print(f"  [NÃO ENCONTRADO] {u['unit']} -> {rel}")
@@ -238,11 +373,25 @@ def parse_dpr(dpr_path: str, dest_dir: str, base_dir: str | None = None, flat: b
         for u in not_found:
             print(f"  - {u['unit']} ({u['path']})")
 
+    if all_skipped:
+        print(f"Ignorados (filtro): {len(all_skipped)}")
+        for s in all_skipped:
+            try:
+                rel = s['file'].relative_to(dest)
+            except ValueError:
+                rel = s['file']
+            print(f"  - {s['unit']} ({rel}): {s['reason']}")
+
     if units_system:
         print()
         print("Units de sistema/VCL (sem caminho — não copiadas):")
         names = ', '.join(u['unit'] for u in units_system)
         print(f"  {names}")
+
+    if codegraph_config:
+        effective_size = max_file_size if max_file_size is not None else 500
+        cfg_path = generate_codegraph_config(dest, all_skipped, max_file_size_kb=effective_size)
+        print(f"\nConfig gerado     : {cfg_path}")
 
 
 def main():
@@ -261,8 +410,34 @@ def main():
         action='store_true',
         help='Copiar todos os arquivos direto na raiz do destino (sem manter estrutura)',
     )
+    parser.add_argument(
+        '--max-file-size',
+        type=int,
+        default=500,
+        metavar='KB',
+        help='Tamanho máximo do arquivo .pas em KB (padrão: 500). '
+             'Arquivos maiores são ignorados para evitar erros WASM no codegraph.',
+    )
+    parser.add_argument(
+        '--validate-content',
+        action='store_true',
+        help='Verificar conteúdo dos arquivos antes de copiar (null bytes, encoding).',
+    )
+    parser.add_argument(
+        '--codegraph-config',
+        action='store_true',
+        help='Gerar .codegraph.json no diretório destino após copiar.',
+    )
     args = parser.parse_args()
-    parse_dpr(args.dpr_file, args.dest_dir, args.base_dir, args.flat)
+    parse_dpr(
+        args.dpr_file,
+        args.dest_dir,
+        args.base_dir,
+        args.flat,
+        max_file_size=args.max_file_size,
+        validate_content=args.validate_content,
+        codegraph_config=args.codegraph_config,
+    )
 
 
 if __name__ == '__main__':
