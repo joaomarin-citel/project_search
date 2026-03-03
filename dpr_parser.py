@@ -193,45 +193,63 @@ def copy_unit_files(
     preserve_structure: bool = True,
     max_file_size: int | None = None,
     validate_content: bool = False,
-) -> tuple[list[Path], list[dict]]:
+    large_dir: Path | None = None,
+) -> tuple[list[Path], list[Path], list[dict]]:
     """
     Copia os arquivos da unit para o destino.
-    Retorna (lista de arquivos copiados, lista de arquivos ignorados).
+    Retorna (primary, large, skipped):
+      primary — arquivos copiados para dest_dir (dentro do limite de tamanho)
+      large   — arquivos copiados para large_dir (acima do limite de tamanho)
+      skipped — arquivos ignorados (problema de conteúdo ou sem large_dir configurado)
 
-    Cada entry em 'ignorados' é um dict com chaves:
+    Cada entry em 'skipped' é um dict com chaves:
       'file'   (Path)  — caminho do arquivo ignorado
       'unit'   (str)   — nome da unit
       'reason' (str)   — motivo do filtro
 
     Parâmetros:
-      max_file_size   — tamanho máximo do .pas em KB; None = sem limite.
-                        Se o .pas exceder o limite, toda a unit é ignorada.
+      max_file_size    — tamanho máximo do .pas em KB; None = sem limite.
+                         Se o .pas exceder o limite e large_dir estiver configurado,
+                         toda a unit é roteada para large_dir; caso contrário, ignorada.
       validate_content — se True, checar null bytes e encoding de cada arquivo
                          antes de copiar.
+      large_dir        — diretório alternativo para arquivos acima do limite.
+                         Mantém a mesma estrutura de subdiretórios que dest_dir.
     """
     if unit_info['path'] is None:
-        return [], []
+        return [], [], []
 
     rel_path = Path(unit_info['path'])
     source_file = base_dir / rel_path
 
     siblings = find_sibling_files(source_file)
     if not siblings:
-        return [], []
+        return [], [], []
 
-    copied: list[Path] = []
+    primary: list[Path] = []
+    large: list[Path] = []
     skipped: list[dict] = []
 
-    # Cheque de tamanho aplicado ao .pas — se falhar, ignora a unit inteira
+    # Cheque de tamanho aplicado ao .pas — roteia a unit inteira se exceder o limite
     if max_file_size is not None and source_file.exists():
         size_kb = source_file.stat().st_size / 1024
         if size_kb > max_file_size:
-            skipped.append({
-                'file': source_file,
-                'unit': unit_info['unit'],
-                'reason': f'too large ({size_kb:.1f} KB > {max_file_size} KB limit)',
-            })
-            return copied, skipped
+            if large_dir is not None:
+                for src in siblings:
+                    if preserve_structure:
+                        dest_file = large_dir / src.relative_to(base_dir)
+                    else:
+                        dest_file = large_dir / src.name
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest_file)
+                    large.append(dest_file)
+            else:
+                skipped.append({
+                    'file': source_file,
+                    'unit': unit_info['unit'],
+                    'reason': f'too large ({size_kb:.1f} KB > {max_file_size} KB limit)',
+                })
+            return primary, large, skipped
 
     for src in siblings:
         if validate_content:
@@ -253,9 +271,9 @@ def copy_unit_files(
 
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest_file)
-        copied.append(dest_file)
+        primary.append(dest_file)
 
-    return copied, skipped
+    return primary, large, skipped
 
 
 def generate_codegraph_config(
@@ -309,6 +327,7 @@ def parse_dpr(
     max_file_size: int | None = None,
     validate_content: bool = False,
     codegraph_config: bool = False,
+    large_dir: str | None = None,
 ) -> None:
     dpr = Path(dpr_path).resolve()
     if not dpr.exists():
@@ -320,9 +339,16 @@ def parse_dpr(
     dest = Path(dest_dir).resolve()
     dest.mkdir(parents=True, exist_ok=True)
 
-    print(f"Arquivo DPR : {dpr}")
+    large: Path | None = None
+    if large_dir is not None:
+        large = Path(large_dir).resolve()
+        large.mkdir(parents=True, exist_ok=True)
+
+    print(f"Arquivo DPR    : {dpr}")
     print(f"Diretório base : {base}")
-    print(f"Destino     : {dest}")
+    print(f"Destino        : {dest}")
+    if large:
+        print(f"Destino grande : {large}")
     print()
 
     dpr_text = dpr.read_text(encoding='utf-8', errors='replace')
@@ -342,39 +368,48 @@ def parse_dpr(
     print(f"  Sem caminho (sistema/VCL) : {len(units_system)}")
     print()
 
-    total_copied = 0
+    total_primary = 0
+    total_large = 0
     not_found = []
     all_skipped: list[dict] = []
 
     for u in units_with_path:
-        copied, skipped = copy_unit_files(
+        primary, large_copied, skipped = copy_unit_files(
             u, base, dest,
             preserve_structure=not flat,
             max_file_size=max_file_size,
             validate_content=validate_content,
+            large_dir=large,
         )
         all_skipped.extend(skipped)
-        if copied:
-            for f in copied:
-                print(f"  [OK] {f.relative_to(dest)}")
-            total_copied += len(copied)
-        elif skipped:
-            for s in skipped:
-                print(f"  [IGNORADO] {u['unit']} -> {s['reason']}")
-        else:
-            rel = u['path']
-            print(f"  [NÃO ENCONTRADO] {u['unit']} -> {rel}")
-            not_found.append(u)
+        if primary:
+            for f in primary:
+                print(f"  [OK]    {f.relative_to(dest)}")
+            total_primary += len(primary)
+        if large_copied:
+            for f in large_copied:
+                print(f"  [GRANDE] {u['unit']} -> {f.relative_to(large)}")
+            total_large += len(large_copied)
+        if not primary and not large_copied:
+            if skipped:
+                for s in skipped:
+                    print(f"  [IGNORADO] {u['unit']} -> {s['reason']}")
+            else:
+                rel = u['path']
+                print(f"  [NÃO ENCONTRADO] {u['unit']} -> {rel}")
+                not_found.append(u)
 
     print()
-    print(f"Arquivos copiados : {total_copied}")
+    print(f"Arquivos copiados (pequenos) : {total_primary}")
+    if large is not None:
+        print(f"Arquivos copiados (grandes)  : {total_large}")
     if not_found:
-        print(f"Não encontrados   : {len(not_found)}")
+        print(f"Não encontrados              : {len(not_found)}")
         for u in not_found:
             print(f"  - {u['unit']} ({u['path']})")
 
     if all_skipped:
-        print(f"Ignorados (filtro): {len(all_skipped)}")
+        print(f"Ignorados (filtro)           : {len(all_skipped)}")
         for s in all_skipped:
             try:
                 rel = s['file'].relative_to(dest)
@@ -391,7 +426,7 @@ def parse_dpr(
     if codegraph_config:
         effective_size = max_file_size if max_file_size is not None else 500
         cfg_path = generate_codegraph_config(dest, all_skipped, max_file_size_kb=effective_size)
-        print(f"\nConfig gerado     : {cfg_path}")
+        print(f"\nConfig gerado : {cfg_path}")
 
 
 def main():
@@ -428,6 +463,14 @@ def main():
         action='store_true',
         help='Gerar .codegraph.json no diretório destino após copiar.',
     )
+    parser.add_argument(
+        '--large-dir',
+        default=None,
+        metavar='DIR',
+        help='Diretório alternativo para arquivos acima de --max-file-size. '
+             'Mantém a mesma estrutura de subdiretórios. '
+             'Se não informado, arquivos grandes são ignorados.',
+    )
     args = parser.parse_args()
     parse_dpr(
         args.dpr_file,
@@ -437,6 +480,7 @@ def main():
         max_file_size=args.max_file_size,
         validate_content=args.validate_content,
         codegraph_config=args.codegraph_config,
+        large_dir=args.large_dir,
     )
 
 

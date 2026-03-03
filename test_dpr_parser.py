@@ -188,10 +188,11 @@ class TestCopyUnitFiles(unittest.TestCase):
 
     def test_copies_pas_and_dfm(self):
         unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
-        copied, skipped = copy_unit_files(unit_info, self.base, self.dest, preserve_structure=True)
-        names = {f.name for f in copied}
+        primary, large, skipped = copy_unit_files(unit_info, self.base, self.dest, preserve_structure=True)
+        names = {f.name for f in primary}
         self.assertIn('untPai.pas', names)
         self.assertIn('untPai.dfm', names)
+        self.assertEqual(large, [])
         self.assertEqual(skipped, [])
 
     def test_preserves_directory_structure(self):
@@ -208,48 +209,88 @@ class TestCopyUnitFiles(unittest.TestCase):
 
     def test_no_path_returns_empty(self):
         unit_info = {'unit': 'Forms', 'path': None}
-        copied, skipped = copy_unit_files(unit_info, self.base, self.dest)
-        self.assertEqual(copied, [])
+        primary, large, skipped = copy_unit_files(unit_info, self.base, self.dest)
+        self.assertEqual(primary, [])
+        self.assertEqual(large, [])
         self.assertEqual(skipped, [])
 
     def test_missing_file_returns_empty(self):
         unit_info = {'unit': 'untNaoExiste', 'path': 'fontes/untNaoExiste.pas'}
-        copied, skipped = copy_unit_files(unit_info, self.base, self.dest)
-        self.assertEqual(copied, [])
+        primary, large, skipped = copy_unit_files(unit_info, self.base, self.dest)
+        self.assertEqual(primary, [])
+        self.assertEqual(large, [])
         self.assertEqual(skipped, [])
 
     def test_file_within_size_limit_is_copied(self):
         unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
-        copied, skipped = copy_unit_files(
+        primary, large, skipped = copy_unit_files(
             unit_info, self.base, self.dest,
             preserve_structure=True,
             max_file_size=500,
         )
-        self.assertIn('untPai.pas', {f.name for f in copied})
+        self.assertIn('untPai.pas', {f.name for f in primary})
+        self.assertEqual(large, [])
         self.assertEqual(skipped, [])
 
-    def test_file_exceeding_size_limit_is_skipped(self):
+    def test_file_exceeding_size_limit_is_skipped_without_large_dir(self):
         large_pas = self.base / 'fontes' / 'genericos' / 'untPai.pas'
         large_pas.write_bytes(b'x' * 1025)  # 1025 bytes > 1 KB limit
         unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
-        copied, skipped = copy_unit_files(
+        primary, large, skipped = copy_unit_files(
             unit_info, self.base, self.dest,
             preserve_structure=True,
             max_file_size=1,
         )
-        self.assertEqual(copied, [])
+        self.assertEqual(primary, [])
+        self.assertEqual(large, [])
         self.assertEqual(len(skipped), 1)
         self.assertIn('too large', skipped[0]['reason'])
         self.assertEqual(skipped[0]['unit'], 'untPai')
 
+    def test_file_exceeding_size_limit_routed_to_large_dir(self):
+        large_pas = self.base / 'fontes' / 'genericos' / 'untPai.pas'
+        large_pas.write_bytes(b'x' * 1025)
+        large_dest = self.tmp / 'large'
+        large_dest.mkdir()
+        unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
+        primary, large, skipped = copy_unit_files(
+            unit_info, self.base, self.dest,
+            preserve_structure=True,
+            max_file_size=1,
+            large_dir=large_dest,
+        )
+        self.assertEqual(primary, [])
+        self.assertEqual(skipped, [])
+        self.assertGreater(len(large), 0)
+        # Deve manter a estrutura de subdiretórios no large_dir
+        expected = large_dest / 'fontes' / 'genericos' / 'untPai.pas'
+        self.assertTrue(expected.exists())
+
+    def test_large_dir_copies_siblings_too(self):
+        large_pas = self.base / 'fontes' / 'genericos' / 'untPai.pas'
+        large_pas.write_bytes(b'x' * 1025)
+        large_dest = self.tmp / 'large'
+        large_dest.mkdir()
+        unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
+        primary, large, skipped = copy_unit_files(
+            unit_info, self.base, self.dest,
+            preserve_structure=True,
+            max_file_size=1,
+            large_dir=large_dest,
+        )
+        names = {f.name for f in large}
+        self.assertIn('untPai.pas', names)
+        self.assertIn('untPai.dfm', names)
+
     def test_no_size_limit_copies_everything(self):
         unit_info = {'unit': 'untPai', 'path': 'fontes/genericos/untPai.pas'}
-        copied, skipped = copy_unit_files(
+        primary, large, skipped = copy_unit_files(
             unit_info, self.base, self.dest,
             preserve_structure=True,
             max_file_size=None,
         )
-        self.assertGreater(len(copied), 0)
+        self.assertGreater(len(primary), 0)
+        self.assertEqual(large, [])
         self.assertEqual(skipped, [])
 
 
